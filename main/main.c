@@ -6,6 +6,8 @@
 
 #include "driver/gpio.h"
 
+#include "esp_log.h"
+
 #include "s_can.h"
 
 // GPIO0 is the CAN H line
@@ -13,8 +15,10 @@
 // Communicate a 0 dragging CAN H Low
 // Communicate a 1 by leaving it floating
 
+static const char* TAG = "main";
+
 void on_receive(const s_can_frame_t* frame){
-    printf("Frame | Id: %d Length: %d Data: ", frame->id, frame->length);
+    printf("Frame | Id: %d | Length: %d | Data: ", frame->id, frame->length);
     for (int i = 0; i < frame->length; i++){
         printf("%c", frame->data[i]);
     }
@@ -23,7 +27,7 @@ void on_receive(const s_can_frame_t* frame){
 
 void app_main(void)
 {
-    printf("Waiting for a second at boot...\n");
+    ESP_LOGI(TAG, "Waiting for a second at boot...");
     vTaskDelay(1000 / portTICK_PERIOD_MS);
 
     s_can_init();
@@ -43,28 +47,30 @@ void app_main(void)
     if (gpio_get_level(GPIO_NUM_5) == 0){
         // Transmit!
         
+        int transmit_count = 0;
         while (true) {
-            printf("Transmitting in 2 seconds!\n");
+            // 10ms is the lowest vTaskDelay can go without config changes
+            // 34 bits in a full "Hello world!" frame
+            vTaskDelay(10 / portTICK_PERIOD_MS);
 
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
-
-            printf("Transmitting...\n");
+            //ESP_LOGI(TAG, "Transmitting...");
 
             char text[] = "Hello world!";
 
             s_can_frame_t frame = {
                 .id = 123,
-                .length = strlen(text),
+                .length = strlen(text)+1,
             };
             
             memcpy(frame.data, text, frame.length);
 
             s_can_transmit(&frame);
+            transmit_count++;
 
-            printf("Transmitted!\n");
+            ESP_LOGI(TAG, "Transmit count: %d", transmit_count);
         }
     } else {
-        printf("Listening...\n");
+        ESP_LOGI(TAG, "Listening...");
     }
 
 }
