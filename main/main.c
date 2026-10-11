@@ -51,7 +51,8 @@ void app_main(void)
         while (true) {
             // 10ms is the lowest vTaskDelay can go without config changes
             // 34 bits in a full "Hello world!" frame
-            vTaskDelay(10 / portTICK_PERIOD_MS);
+            // 2068 bits at most in a full frame (from the frame begin 1 0 1 sequence to the final frame end 0)
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
 
             //ESP_LOGI(TAG, "Transmitting...");
 
