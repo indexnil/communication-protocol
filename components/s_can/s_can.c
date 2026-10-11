@@ -1,5 +1,7 @@
 #include <stdint.h>
 #include <inttypes.h>
+#include <string.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,7 +16,9 @@
 #define CAN_H_GPIO GPIO_NUM_0
 #define RECEIVE_FRAME_SLOTS 8
 
-#define BIT_DURATION_US 35
+#define BIT_DURATION_US 290
+
+#define MAX_IDENTICAL_BITS 5
 
 static const char* TAG = "s_can";
 
@@ -30,8 +34,12 @@ static int receive_frame_data_index = 0;
 static uint8_t frame_byte = 0;
 static uint8_t frame_byte_index = 0;
 
+// On the transmit end
+static int previous_bit = 0;
+static int identical_bit_counter = 0;
+
 // Frames start with a 1 (this one doesnt have a state), then 0 (start measuring the time), and then 1 again (at this point we calculate the bit duration from the time).
-// Frames always end with a 0, this is the FRAME_END state. We need this state in the code otherwise the logic would recognise this as a new frame begin sequence.
+// Frames always end with a 0, this is the FRAME_END state, that then goes back to 1 after one bit duration.
 typedef enum {
     NONE,
     FRAME_BEGIN_LOW,
@@ -49,10 +57,41 @@ static uint64_t last_bit_edge_time;
 
 static uint32_t bit_duration;
 
-static int frame_errors = 0;
+typedef enum {
+    INVALID_FRAME_END,
+    FRAME_BEGIN_SIGNAL_NOISE,
+    SIGNAL_NOISE,
+    NUM_ERROR_REASONS,
+} frame_error_reason_t;
+
+static inline const char* frame_error_reason_to_string(frame_error_reason_t reason){
+    switch (reason){
+        case INVALID_FRAME_END:        return "INVALID_FRAME_END";
+        case FRAME_BEGIN_SIGNAL_NOISE: return "FRAME_BEGIN_SIGNAL_NOISE";
+        case SIGNAL_NOISE:             return "SIGNAL_NOISE";
+        default:                       return "Unknown error";
+    }
+}
+static int frame_errors[NUM_ERROR_REASONS] = {};
+
+static void s_can_reset_stuffing(){
+    identical_bit_counter = 0;  
+}
 
 static void s_can_transmit_bit(uint32_t level){
+    // Bit stuffing first
+    if (previous_bit == level){
+        identical_bit_counter++;
+        if (identical_bit_counter > MAX_IDENTICAL_BITS){
+            gpio_set_level(CAN_H_GPIO, !level);
+            esp_rom_delay_us(BIT_DURATION_US);
+            identical_bit_counter = 0;
+        }
+    }
+
+    // Transmit the bit    
     gpio_set_level(CAN_H_GPIO, level);
+    previous_bit = level;
     esp_rom_delay_us(BIT_DURATION_US);
 }
 
@@ -66,6 +105,9 @@ static void s_can_transmit_byte(uint8_t byte){
 // Yields until everything is transmitted
 // For now, assume no one else is transmitting.
 void s_can_transmit(const s_can_frame_t* frame){
+
+    // New frame so reset this + we dont want it in the frame start sequence
+    s_can_reset_stuffing();
 
     // Frame start sequence
     s_can_transmit_bit(1);
@@ -83,11 +125,15 @@ void s_can_transmit(const s_can_frame_t* frame){
         s_can_transmit_byte(frame->data[i]);
     }
 
+    // We dont want bit stuffing in the frame end sequence
+    s_can_reset_stuffing();
+
     // Frame end
     s_can_transmit_bit(0);
 
     // Go back to floating now
-    gpio_set_level(CAN_H_GPIO, 1);
+    s_can_transmit_bit(1);
+
 }
 
 esp_err_t s_can_set_receive_callback(s_can_receive_callback_t callback){
@@ -95,11 +141,11 @@ esp_err_t s_can_set_receive_callback(s_can_receive_callback_t callback){
     return ESP_OK;
 }
 
-static void IRAM_ATTR s_can_abort_frame(){
+static void IRAM_ATTR s_can_abort_frame(frame_error_reason_t reason){
     frame_id_index = 0;
 
     frame_receive_state = NONE;
-    frame_errors++;
+    frame_errors[reason]++;
 }
 
 static void IRAM_ATTR s_can_on_bit(int level){
@@ -171,7 +217,7 @@ static void IRAM_ATTR s_can_on_bit(int level){
                 vTaskNotifyGiveFromISR(s_can_receive_task_handle, &isr_woke_receive_task);
             } else {
                 // we are probably about to receive a bunch of junk bits after this because the frame didnt end properly
-                s_can_abort_frame();
+                s_can_abort_frame(INVALID_FRAME_END);
             }
             break;
         default:
@@ -213,15 +259,14 @@ static void IRAM_ATTR s_can_on_interrupt(void* arg){
                 int bit_count = (delta + bit_duration/2) / bit_duration;
                 if (bit_count == 0){
                     // Noise consisting of less than half a bit, might be safe to ignore, but might also not be safe to ignore.
-                    s_can_abort_frame();
+                    s_can_abort_frame(FRAME_BEGIN_SIGNAL_NOISE);
+                    break;
                 }
                 for (int i = 1; i < bit_count; i++){
                     // The level we had previously is the one that matters here
                     s_can_on_bit(1);
                 }
 
-            } else {
-                s_can_abort_frame();
             }
             break;
         }
@@ -230,7 +275,8 @@ static void IRAM_ATTR s_can_on_interrupt(void* arg){
             int bit_count = (delta + bit_duration/2) / bit_duration;
             if (bit_count == 0){
                 // Noise consisting of less than half a bit, might be safe to ignore, but might also not be safe to ignore.
-                s_can_abort_frame();
+                s_can_abort_frame(SIGNAL_NOISE);
+                break;
             }
             for (int i = 0; i < bit_count; i++){
                 // The level we had previously is the one that matters here
@@ -250,17 +296,35 @@ static void IRAM_ATTR s_can_on_interrupt(void* arg){
 static void s_can_receive_task(void* arg){
     int read_slot = 0;
     int overflows = 0; // Just for logging
+    int receive_count = 0; // Just for logging, includes frames that the interrupt handed us but that got overwritten before the callback had time to run.
+    int pending_high_watermark = 0; // Just for logging
     while (true) {
         int pending = ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+
+        receive_count++;
+
         // pending > RECEIVE_FRAME_SLOTS means our data has been overwritten already, >= means that an interrupt can happen at any moment and write over the data for the current callback.
         if (pending < RECEIVE_FRAME_SLOTS){
-            ESP_LOGI(TAG, "Received frame. bit_duration: %" PRIu32 "us overflows: %d frame_errors %d", bit_duration, overflows, frame_errors);
+            // Just threw this in here, should maybe be moved somewhere else
+            for (int i = 0; i < NUM_ERROR_REASONS-1; i++){
+                if (frame_errors[i] == 0){
+                    continue;
+                }
+                const char* reason = frame_error_reason_to_string(i);
+                ESP_LOGI(TAG, "%s: %d", reason, frame_errors[i]);
+            }
+            ESP_LOGI(TAG, "Received frame. bit_duration: %" PRIu32 "us | overflows: %d | receive count: %d", bit_duration, overflows, receive_count);
             if (receive_callback != NULL){
                 receive_callback(&receive_frames[read_slot]);
             }
         } else {
             // Overflow, skip the callback because the data currently sitting there is intended for a future callback.
             overflows++;
+        }
+
+        // Take -1 to subtract the frame we just cleared
+        if (pending-1 > pending_high_watermark){
+            pending_high_watermark = pending - 1;
         }
 
         read_slot+=1;
